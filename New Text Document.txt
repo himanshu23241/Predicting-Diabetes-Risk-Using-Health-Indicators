@@ -1,0 +1,291 @@
+# ============================
+# 1) Setup: imports, constants and robust preprocessing
+# ============================
+import time
+import os
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, classification_report, roc_auc_score, confusion_matrix
+from sklearn.preprocessing import StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.pipeline import Pipeline, make_pipeline
+from sklearn.random_projection import GaussianRandomProjection
+
+# ----------------------------
+# User-editable config
+# ----------------------------
+DATA_PATH = r"E:\DSc_project\diabetes_012_health_indicators_BRFSS2015.csv"
+TARGET_COLUMN = "Diabetes_012"   # column in your CSV
+RANDOM_SEED = 42
+TEST_SIZE = 0.20
+
+# ----------------------------
+# Basic checks & load
+# ----------------------------
+print("Checking file exists:", DATA_PATH)
+if not os.path.isfile(DATA_PATH):
+    raise FileNotFoundError(f"Dataset not found at {DATA_PATH}. Put the CSV at this path or update DATA_PATH.")
+
+# load dataset
+df = pd.read_csv(DATA_PATH)
+print("Dataset loaded. Shape:", df.shape)
+
+# show first rows (small preview)
+display(df.head(7))
+print("\nColumns:", df.columns.tolist())
+
+# ----------------------------
+# Ensure target exists
+# ----------------------------
+if TARGET_COLUMN not in df.columns:
+    raise ValueError(f"Target column '{TARGET_COLUMN}' not found. Available columns: {df.columns.tolist()}")
+
+# ----------------------------
+# Convert multiclass Diabetes_012 -> binary (0 = no, 1 = prediabetes/diabetes)
+# Rationale: original dataset encodes 0 = no, 1 = prediabetes, 2 = diabetes.
+# For binary classification we map 1 and 2 to 1 (diabetic/prediabetic) and 0 remains 0.
+# ----------------------------
+print("\nOriginal unique target values:", sorted(df[TARGET_COLUMN].unique()))
+df[TARGET_COLUMN] = df[TARGET_COLUMN].apply(lambda x: 1 if x > 0 else 0)
+print("After conversion, unique target values (should be [0,1]):", sorted(df[TARGET_COLUMN].unique()))
+
+# ----------------------------
+# Quick class balance check (important: imbalanced classes affect metrics)
+# ----------------------------
+class_counts = df[TARGET_COLUMN].value_counts()
+print("\nClass distribution (counts):")
+print(class_counts)
+pct = class_counts / class_counts.sum() * 100
+print("\nClass distribution (percentage):")
+print(pct.round(2))
+
+# If classes are extremely imbalanced, note to consider resampling or class_weight
+if pct.min() < 10.0:
+    print("\nWARNING: Minor class <10% of data. Consider using class_weight='balanced' in the classifier\n"
+          "or resampling (SMOTE / random oversampling) for training. Document this in your report.")
+
+# ----------------------------
+# Basic cleaning: drop columns with >50% missing values (optional)
+# ----------------------------
+missing_ratio = df.isna().mean()
+cols_to_drop = missing_ratio[missing_ratio > 0.5].index.tolist()
+if cols_to_drop:
+    print("\nDropping columns with >50% missing values:", cols_to_drop)
+    df = df.drop(columns=cols_to_drop)
+
+# ----------------------------
+# Separate features and target
+# ----------------------------
+X = df.drop(columns=[TARGET_COLUMN])
+y = df[TARGET_COLUMN].astype(int)
+
+# ----------------------------
+# Identify numeric and categorical columns
+# ----------------------------
+num_cols = X.select_dtypes(include=[np.number]).columns.tolist()
+cat_cols = X.select_dtypes(include=['object', 'category', 'bool']).columns.tolist()
+
+print("\nNumeric columns (count={}):".format(len(num_cols)), num_cols)
+print("Categorical columns (count={}):".format(len(cat_cols)), cat_cols)
+
+# ----------------------------
+# Impute numeric columns (median) and encode categorical columns (one-hot)
+# ----------------------------
+# Numeric imputer
+num_imputer = SimpleImputer(strategy='median')
+if num_cols:
+    X_num = pd.DataFrame(num_imputer.fit_transform(X[num_cols]), columns=num_cols)
+else:
+    X_num = pd.DataFrame(index=X.index)  # empty
+
+# Categorical encoding
+if cat_cols:
+    # Convert boolean-like to string first to avoid get_dummies pitfalls
+    X_cat = X[cat_cols].astype(str).fillna('missing')
+    X_cat_encoded = pd.get_dummies(X_cat, drop_first=True)
+else:
+    X_cat_encoded = pd.DataFrame(index=X.index)  # empty
+
+# Combine processed features
+X_processed = pd.concat([X_num.reset_index(drop=True), X_cat_encoded.reset_index(drop=True)], axis=1)
+print("\nProcessed feature matrix shape:", X_processed.shape)
+
+# ----------------------------
+# Optional: Save processed dataset for inspection / reproducibility
+# ----------------------------
+processed_path = os.path.splitext(DATA_PATH)[0] + "_processed.csv"
+X_processed[TARGET_COLUMN] = y.values  # temporarily attach to preserve alignment
+X_processed.to_csv(processed_path, index=False)
+# detach target column again from feature matrix
+X_processed = X_processed.drop(columns=[TARGET_COLUMN])
+print(f"Saved a processed preview dataset to: {processed_path} (you can open this to verify)")
+
+# ----------------------------
+# Train-test split (stratified)
+# ----------------------------
+X_train, X_test, y_train, y_test = train_test_split(
+    X_processed, y, test_size=TEST_SIZE, random_state=RANDOM_SEED, stratify=y
+)
+print("\nTrain/test sizes:", X_train.shape, X_test.shape)
+print("Train class distribution:\n", y_train.value_counts(normalize=True).round(3) * 100)
+print("Test class distribution:\n", y_test.value_counts(normalize=True).round(3) * 100)
+
+# ----------------------------
+# Helper: function to train & evaluate Logistic Regression (binary-safe)
+# This ensures Block 5 can be executed without modification later.
+# ----------------------------
+def train_and_evaluate_logistic(X_tr, X_te, y_tr, y_te, use_class_weight=False, max_iter=1000):
+    """
+    Trains a Logistic Regression with a StandardScaler in a Pipeline,
+    measures training time, and returns metrics and model pipeline.
+    """
+    # if class imbalance, optionally use class_weight='balanced'
+    clf_kwargs = {'max_iter': max_iter, 'solver': 'lbfgs'}
+    if use_class_weight:
+        clf_kwargs['class_weight'] = 'balanced'
+    pipe = Pipeline([
+        ('scaler', StandardScaler()),
+        ('clf', LogisticRegression(**clf_kwargs))
+    ])
+    start_time = time.time()
+    pipe.fit(X_tr, y_tr)
+    end_time = time.time()
+    train_time = end_time - start_time
+    
+    y_pred = pipe.predict(X_te)
+    y_proba = pipe.predict_proba(X_te)[:, 1]  # safe because target is binary
+    
+    acc = accuracy_score(y_te, y_pred)
+    roc = roc_auc_score(y_te, y_proba)
+    report = classification_report(y_te, y_pred, digits=4)
+    cm = confusion_matrix(y_te, y_pred)
+    
+    results = {
+        'pipeline': pipe,
+        'train_time_sec': train_time,
+        'accuracy': acc,
+        'roc_auc': roc,
+        'classification_report': report,
+        'confusion_matrix': cm
+    }
+    return results
+
+# ----------------------------
+# Example sanity-run (uncomment to run now) — this replicates Block 5 behavior
+# ----------------------------
+print("\nRunning a quick sanity training (Logistic Regression on full features)...")
+results_full = train_and_evaluate_logistic(X_train, X_test, y_train, y_test, use_class_weight=False)
+print(f"Training time (full data): {results_full['train_time_sec']:.4f} s")
+print(f"Accuracy (full data): {results_full['accuracy']:.4f}")
+print(f"ROC AUC (full data): {results_full['roc_auc']:.4f}")
+print("\nClassification report (full data):\n", results_full['classification_report'])
+print("\nConfusion Matrix:\n", results_full['confusion_matrix'])
+
+
+print("\nSetup complete. You can now run Block 5 to train Logistic Regression on 'full' features")
+print("Use train_and_evaluate_logistic(X_train, X_test, y_train, y_test) to train and get metrics.")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# 5) Train Logistic Regression on full data (with scaling in a pipeline)
+from sklearn.pipeline import Pipeline
+pipe_full = Pipeline([('scaler', StandardScaler()), ('clf', LogisticRegression(max_iter=1000, solver='lbfgs'))])
+
+start = time.time()
+pipe_full.fit(X_train, y_train)
+end = time.time()
+train_time_full = end - start
+
+y_pred_full = pipe_full.predict(X_test)
+acc_full = accuracy_score(y_test, y_pred_full)
+roc_full = roc_auc_score(y_test, pipe_full.predict_proba(X_test)[:,1]) if len(np.unique(y_test))>1 else None
+
+print(f"Full-data training time: {train_time_full:.4f} seconds")
+print(f"Full-data accuracy: {acc_full:.4f}")
+if roc_full is not None:
+    print(f"Full-data ROC AUC: {roc_full:.4f}")
+print('\nClassification report (full data):')
+print(classification_report(y_test, y_pred_full))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# 6) Apply Random Projection and retrain
+d = X_train.shape[1]
+k = min(d, max(10, int(d/2)))
+
+print('Original dimension d =', d, 'Using k =', k)
+
+rp = GaussianRandomProjection(n_components=k, random_state=42)
+X_train_rp = rp.fit_transform(X_train)
+X_test_rp = rp.transform(X_test)
+
+print('Reduced shapes:', X_train_rp.shape, X_test_rp.shape)
+
+pipe_rp = Pipeline([('scaler', StandardScaler()), ('clf', LogisticRegression(max_iter=1000, solver='lbfgs'))])
+
+start = time.time()
+pipe_rp.fit(X_train_rp, y_train)
+end = time.time()
+train_time_rp = end - start
+
+y_pred_rp = pipe_rp.predict(X_test_rp)
+acc_rp = accuracy_score(y_test, y_pred_rp)
+roc_rp = roc_auc_score(y_test, pipe_rp.predict_proba(X_test_rp)[:,1]) if len(np.unique(y_test))>1 else None
+
+print(f"RP-data training time: {train_time_rp:.4f} seconds")
+print(f"RP-data accuracy: {acc_rp:.4f}")
+if roc_rp is not None:
+    print(f"RP-data ROC AUC: {roc_rp:.4f}")
+print('\nClassification report (RP data):')
+print(classification_report(y_test, y_pred_rp))
